@@ -6,25 +6,32 @@ const { google } = require("googleapis");
 const botClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 const userClient = new WebClient(process.env.SLACK_USER_TOKEN);
 
-const CHAT_CHANNEL_ID = process.env.CHAT_CHANNEL_ID;
-const REPORT_CHANNELS = [
-  { id: process.env.REPORT_IN_CHANNEL_ID, name: "all-出勤日報" },
-  { id: process.env.REPORT_OUT_CHANNEL_ID, name: "all-退勤日報" }
-].filter(x => x.id);
+const CHAT_CHANNEL = {
+  id: process.env.CHAT_CHANNEL_ID,
+  name: "all-雑談"
+};
+
+const REPORT_IN_CHANNEL = {
+  id: process.env.REPORT_IN_CHANNEL_ID,
+  name: "all-出勤日報",
+  category: "report_in_reply"
+};
+
+const REPORT_OUT_CHANNEL = {
+  id: process.env.REPORT_OUT_CHANNEL_ID,
+  name: "all-退勤日報",
+  category: "report_out_reply"
+};
+
+const REPORT_CHANNELS = [REPORT_IN_CHANNEL, REPORT_OUT_CHANNEL].filter(x => x.id);
+
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+const RAW_DAILY_SHEET = "raw_daily";
 
 const REPORT_BOT_ID = process.env.REPORT_BOT_ID || "";
 const REPORT_APP_ID = process.env.REPORT_APP_ID || "";
 const REPORT_TEXT_KEYWORD = process.env.REPORT_TEXT_KEYWORD || "";
-
-const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const RAW_DAILY_SHEET = "raw_daily";
-const RAW_RUN_LOG_SHEET = "raw_run_log";
-
 const PARENT_LOOKBACK_DAYS = Number(process.env.PARENT_LOOKBACK_DAYS || 2);
-
-function nowJst() {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
-}
 
 function nowJstString() {
   return new Intl.DateTimeFormat("sv-SE", {
@@ -57,7 +64,8 @@ function formatDateJST(date) {
 }
 
 function getYesterdayRangeJST() {
-  const jstNow = nowJst();
+  const now = new Date();
+  const jstNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
 
   const from = new Date(jstNow);
   from.setDate(from.getDate() - 1);
@@ -97,7 +105,7 @@ async function appendRows(sheetName, rows) {
   const sheets = await getSheetsClient();
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${sheetName}!A:Z`,
+    range: `${sheetName}!A:H`,
     valueInputOption: "RAW",
     insertDataOption: "INSERT_ROWS",
     requestBody: { values: rows }
@@ -153,7 +161,7 @@ async function safeFetchReplies(channel, ts) {
       ts,
       error: err?.data?.error || err?.message || "unknown_error"
     });
-    await sleep(1500);
+    await sleep(1200);
     return [];
   }
 }
@@ -225,83 +233,78 @@ function inRangeSlackTs(ts, fromDate, toDate) {
   return n >= fromSec && n <= toSec;
 }
 
-async function collectChatRanking({ runId, from, to, usersMap }) {
+function buildDailyRows({ runId, date, category, channelId, channelName, counter, usersMap }) {
+  return Object.entries(counter)
+    .map(([userId, count]) => [
+      runId,
+      date,
+      category,
+      userId,
+      usersMap[userId]?.userName || userId,
+      count,
+      channelId,
+      channelName
+    ])
+    .sort((a, b) => b[5] - a[5]);
+}
+
+async function collectChatRows({ runId, from, to, usersMap }) {
+  if (!CHAT_CHANNEL.id) return [];
+
   const oldest = toSlackTs(from);
   const latest = toSlackTs(to);
-  const counter = {};
   const targetDate = formatDateJST(from);
+  const counter = {};
 
-  const messages = await fetchAllHistory(CHAT_CHANNEL_ID, oldest, latest);
+  const messages = await fetchAllHistory(CHAT_CHANNEL.id, oldest, latest);
 
-  let parentCounted = 0;
-  let replyCounted = 0;
+  let countedPosts = 0;
+  let countedReplies = 0;
 
   for (const msg of messages) {
-    if (isHumanMessage(msg)) {
+    if (isHumanMessage(msg) && inRangeSlackTs(msg.ts, from, to)) {
       counter[msg.user] = (counter[msg.user] || 0) + 1;
-      parentCounted += 1;
+      countedPosts += 1;
     }
 
     if (msg.reply_count && msg.ts) {
-      const replies = await safeFetchReplies(CHAT_CHANNEL_ID, msg.ts);
+      const replies = await safeFetchReplies(CHAT_CHANNEL.id, msg.ts);
 
       for (const reply of replies.slice(1)) {
         if (!isHumanMessage(reply)) continue;
         if (!inRangeSlackTs(reply.ts, from, to)) continue;
 
         counter[reply.user] = (counter[reply.user] || 0) + 1;
-        replyCounted += 1;
+        countedReplies += 1;
       }
 
       await sleep(250);
     }
   }
 
-  console.log("[chat summary]", {
-    targetDate,
-    channelId: CHAT_CHANNEL_ID,
-    parentCandidates: messages.length,
-    parentsCounted: parentCounted,
-    repliesCounted: replyCounted,
-    uniqueUsers: Object.keys(counter).length
+  console.log("[chat]", {
+    date: targetDate,
+    channel: CHAT_CHANNEL.name,
+    parentMessagesFetched: messages.length,
+    postsCounted: countedPosts,
+    repliesCounted: countedReplies,
+    users: Object.keys(counter).length
   });
 
-  const dailyRows = Object.entries(counter)
-    .map(([userId, count]) => ({
-      run_id: runId,
-      date: targetDate,
-      category: "chat",
-      user_id: userId,
-      user_name: usersMap[userId]?.userName || userId,
-      count,
-      channel_ids: CHAT_CHANNEL_ID,
-      channel_names: "all-雑談",
-      note: `parent+reply aggregated on ${targetDate}`
-    }))
-    .sort((a, b) => b.count - a.count);
-
-  const runLogRows = [[
+  return buildDailyRows({
     runId,
-    targetDate,
-    "chat",
-    CHAT_CHANNEL_ID,
-    "all-雑談",
-    messages.length,
-    parentCounted,
-    replyCounted,
-    replyCounted,
-    Object.keys(counter).length,
-    "chat aggregated",
-    nowJstString()
-  ]];
-
-  return { dailyRows, runLogRows };
+    date: targetDate,
+    category: "chat",
+    channelId: CHAT_CHANNEL.id,
+    channelName: CHAT_CHANNEL.name,
+    counter,
+    usersMap
+  });
 }
 
-async function collectReportReplyRanking({ runId, from, to, usersMap }) {
+async function collectReportRowsForChannel({ runId, from, to, usersMap, channel }) {
   const targetDate = formatDateJST(from);
   const counter = {};
-  const runLogRows = [];
 
   const parentSearchFrom = new Date(from);
   parentSearchFrom.setDate(parentSearchFrom.getDate() - PARENT_LOOKBACK_DAYS);
@@ -309,76 +312,48 @@ async function collectReportReplyRanking({ runId, from, to, usersMap }) {
   const oldest = toSlackTs(parentSearchFrom);
   const latest = toSlackTs(to);
 
-  for (const channel of REPORT_CHANNELS) {
-    const messages = await fetchAllHistory(channel.id, oldest, latest);
+  const messages = await fetchAllHistory(channel.id, oldest, latest);
 
-    let matchedParentCount = 0;
-    let repliesSeen = 0;
-    let repliesCounted = 0;
+  let matchedParents = 0;
+  let repliesCounted = 0;
 
-    for (const msg of messages) {
-      if (!isTargetReportParent(msg)) continue;
-      matchedParentCount += 1;
+  for (const msg of messages) {
+    if (!isTargetReportParent(msg)) continue;
+    matchedParents += 1;
 
-      if (!msg.ts) continue;
+    if (!msg.ts) continue;
 
-      const replies = await safeFetchReplies(channel.id, msg.ts);
+    const replies = await safeFetchReplies(channel.id, msg.ts);
 
-      for (const reply of replies.slice(1)) {
-        repliesSeen += 1;
+    for (const reply of replies.slice(1)) {
+      if (!isHumanMessage(reply)) continue;
+      if (!inRangeSlackTs(reply.ts, from, to)) continue;
 
-        if (!isHumanMessage(reply)) continue;
-        if (!inRangeSlackTs(reply.ts, from, to)) continue;
-
-        counter[reply.user] = (counter[reply.user] || 0) + 1;
-        repliesCounted += 1;
-      }
-
-      await sleep(300);
+      counter[reply.user] = (counter[reply.user] || 0) + 1;
+      repliesCounted += 1;
     }
 
-    console.log("[report summary]", {
-      targetDate,
-      channelId: channel.id,
-      channelName: channel.name,
-      parentCandidates: messages.length,
-      matchedParents: matchedParentCount,
-      repliesSeen,
-      repliesCounted,
-      uniqueUsersSoFar: Object.keys(counter).length
-    });
-
-    runLogRows.push([
-      runId,
-      targetDate,
-      "report_reply",
-      channel.id,
-      channel.name,
-      messages.length,
-      matchedParentCount,
-      repliesSeen,
-      repliesCounted,
-      Object.keys(counter).length,
-      `reply_ts filtered; parent lookback=${PARENT_LOOKBACK_DAYS}d`,
-      nowJstString()
-    ]);
+    await sleep(300);
   }
 
-  const dailyRows = Object.entries(counter)
-    .map(([userId, count]) => ({
-      run_id: runId,
-      date: targetDate,
-      category: "report_reply",
-      user_id: userId,
-      user_name: usersMap[userId]?.userName || userId,
-      count,
-      channel_ids: REPORT_CHANNELS.map(x => x.id).join(","),
-      channel_names: REPORT_CHANNELS.map(x => x.name).join(","),
-      note: `reply_ts filtered on ${targetDate}; parent lookback=${PARENT_LOOKBACK_DAYS}d`
-    }))
-    .sort((a, b) => b.count - a.count);
+  console.log("[report]", {
+    date: targetDate,
+    channel: channel.name,
+    parentCandidatesFetched: messages.length,
+    matchedParents,
+    repliesCounted,
+    users: Object.keys(counter).length
+  });
 
-  return { dailyRows, runLogRows };
+  return buildDailyRows({
+    runId,
+    date: targetDate,
+    category: channel.category,
+    channelId: channel.id,
+    channelName: channel.name,
+    counter,
+    usersMap
+  });
 }
 
 async function main() {
@@ -386,59 +361,47 @@ async function main() {
   const { from, to } = getYesterdayRangeJST();
   const targetDate = formatDateJST(from);
 
-  console.log("==================================================");
   console.log("[start]", {
     runId,
     targetDate,
     from: from.toISOString(),
-    to: to.toISOString(),
-    chatChannel: CHAT_CHANNEL_ID,
-    reportChannels: REPORT_CHANNELS.map(x => `${x.name}(${x.id})`).join(", "),
-    reportBotId: REPORT_BOT_ID || "(not set)",
-    reportAppId: REPORT_APP_ID || "(not set)",
-    reportTextKeyword: REPORT_TEXT_KEYWORD || "(not set)",
-    parentLookbackDays: PARENT_LOOKBACK_DAYS
+    to: to.toISOString()
   });
-  console.log("==================================================");
 
   const usersMap = await fetchUsersMap();
-  console.log("[users loaded]", Object.keys(usersMap).length);
 
-  const chatResult = CHAT_CHANNEL_ID
-    ? await collectChatRanking({ runId, from, to, usersMap })
-    : { dailyRows: [], runLogRows: [] };
+  const chatRows = await collectChatRows({ runId, from, to, usersMap });
 
-  const reportResult = await collectReportReplyRanking({ runId, from, to, usersMap });
+  const reportInRows = REPORT_IN_CHANNEL.id
+    ? await collectReportRowsForChannel({
+        runId,
+        from,
+        to,
+        usersMap,
+        channel: REPORT_IN_CHANNEL
+      })
+    : [];
 
-  const dailyRows = [...chatResult.dailyRows, ...reportResult.dailyRows];
-  const runLogRows = [...chatResult.runLogRows, ...reportResult.runLogRows];
+  const reportOutRows = REPORT_OUT_CHANNEL.id
+    ? await collectReportRowsForChannel({
+        runId,
+        from,
+        to,
+        usersMap,
+        channel: REPORT_OUT_CHANNEL
+      })
+    : [];
 
-  if (dailyRows.length) {
-    await appendRows(
-      RAW_DAILY_SHEET,
-      dailyRows.map(r => [
-        r.run_id,
-        r.date,
-        r.category,
-        r.user_id,
-        r.user_name,
-        r.count,
-        r.channel_ids,
-        r.channel_names,
-        r.note
-      ])
-    );
-  }
+  const allRows = [...chatRows, ...reportInRows, ...reportOutRows];
 
-  if (runLogRows.length) {
-    await appendRows(RAW_RUN_LOG_SHEET, runLogRows);
+  if (allRows.length) {
+    await appendRows(RAW_DAILY_SHEET, allRows);
   }
 
   console.log("[done]", {
     runId,
     targetDate,
-    dailyRows: dailyRows.length,
-    runLogRows: runLogRows.length
+    rows: allRows.length
   });
 }
 
