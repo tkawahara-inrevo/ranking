@@ -65,15 +65,24 @@ function formatDateJST(date) {
 
 function getYesterdayRangeJST() {
   const now = new Date();
-  const jstNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
 
-  const from = new Date(jstNow);
-  from.setDate(from.getDate() - 1);
-  from.setHours(0, 0, 0, 0);
+  // JSTの「今日」の年月日を取得
+  const parts = new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(now);
 
-  const to = new Date(jstNow);
-  to.setDate(to.getDate() - 1);
-  to.setHours(23, 59, 59, 999);
+  const year = Number(parts.find(p => p.type === "year").value);
+  const month = Number(parts.find(p => p.type === "month").value);
+  const day = Number(parts.find(p => p.type === "day").value);
+
+  // JSTの昨日 00:00:00.000 を UTC に直して作る
+  const from = new Date(Date.UTC(year, month - 1, day - 1, 0 - 9, 0, 0, 0));
+
+  // JSTの昨日 23:59:59.999 を UTC に直して作る
+  const to = new Date(Date.UTC(year, month - 1, day - 1, 23 - 9, 59, 59, 999));
 
   return { from, to };
 }
