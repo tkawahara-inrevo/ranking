@@ -1,0 +1,14 @@
+{
+  "name": "slack-ranking-cron",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@slack/web-api": "^7.11.0",
+    "dotenv": "^16.4.5",
+    "googleapis": "^144.0.0"
+  }
+}
