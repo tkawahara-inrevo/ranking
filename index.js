@@ -365,43 +365,102 @@ async function collectReportRowsForChannel({ runId, from, to, usersMap, channel 
   });
 }
 
+function getJstDayRange(dateString) {
+  const [year, month, day] = dateString.split("-").map(Number);
+
+  const from = new Date(Date.UTC(year, month - 1, day, -9, 0, 0, 0));
+  const to = new Date(Date.UTC(year, month - 1, day, 14, 59, 59, 999));
+
+  return { from, to };
+}
+
+function formatDateKeyJST(date) {
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(date);
+}
+
+function getDateRangeList(startDate, endDate) {
+  const dates = [];
+  const current = new Date(`${startDate}T00:00:00Z`);
+  const end = new Date(`${endDate}T00:00:00Z`);
+
+  while (current <= end) {
+    const y = current.getUTCFullYear();
+    const m = String(current.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(current.getUTCDate()).padStart(2, "0");
+    dates.push(`${y}-${m}-${d}`);
+    current.setUTCDate(current.getUTCDate() + 1);
+  }
+
+  return dates;
+}
+
 async function main() {
   const runId = makeRunId();
-  const { from, to } = getYesterdayRangeJST();
-  const targetDate = formatDateJST(from);
+
+  const backfillStart = process.env.BACKFILL_START_DATE || "";
+  const backfillEnd = process.env.BACKFILL_END_DATE || "";
+
+  let targetDates = [];
+
+  if (backfillStart && backfillEnd) {
+    targetDates = getDateRangeList(backfillStart, backfillEnd);
+  } else {
+    const { from } = getYesterdayRangeJST();
+    targetDates = [formatDateKeyJST(from)];
+  }
 
   console.log("[start]", {
     runId,
-    targetDate,
-    from: from.toISOString(),
-    to: to.toISOString()
+    mode: backfillStart && backfillEnd ? "backfill" : "daily",
+    targetDatesCount: targetDates.length,
+    firstDate: targetDates[0],
+    lastDate: targetDates[targetDates.length - 1]
   });
 
   const usersMap = await fetchUsersMap();
+  const allRows = [];
 
-  const chatRows = await collectChatRows({ runId, from, to, usersMap });
+  for (const targetDate of targetDates) {
+    const { from, to } = getJstDayRange(targetDate);
 
-  const reportInRows = REPORT_IN_CHANNEL.id
-    ? await collectReportRowsForChannel({
-        runId,
-        from,
-        to,
-        usersMap,
-        channel: REPORT_IN_CHANNEL
-      })
-    : [];
+    console.log("[processing]", {
+      targetDate,
+      from: from.toISOString(),
+      to: to.toISOString()
+    });
 
-  const reportOutRows = REPORT_OUT_CHANNEL.id
-    ? await collectReportRowsForChannel({
-        runId,
-        from,
-        to,
-        usersMap,
-        channel: REPORT_OUT_CHANNEL
-      })
-    : [];
+    const chatRows = await collectChatRows({ runId, from, to, usersMap });
 
-  const allRows = [...chatRows, ...reportInRows, ...reportOutRows];
+    const reportInRows = REPORT_IN_CHANNEL.id
+      ? await collectReportRowsForChannel({
+          runId,
+          from,
+          to,
+          usersMap,
+          channel: REPORT_IN_CHANNEL
+        })
+      : [];
+
+    const reportOutRows = REPORT_OUT_CHANNEL.id
+      ? await collectReportRowsForChannel({
+          runId,
+          from,
+          to,
+          usersMap,
+          channel: REPORT_OUT_CHANNEL
+        })
+      : [];
+
+    allRows.push(...chatRows, ...reportInRows, ...reportOutRows);
+
+    // Slack APIに優しく少し待つ
+    await sleep(1000);
+  }
 
   if (allRows.length) {
     await appendRows(RAW_DAILY_SHEET, allRows);
@@ -409,8 +468,8 @@ async function main() {
 
   console.log("[done]", {
     runId,
-    targetDate,
-    rows: allRows.length
+    rows: allRows.length,
+    dates: targetDates.length
   });
 }
 
